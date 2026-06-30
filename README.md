@@ -1,115 +1,114 @@
 # Identifying AV Trips — What We Found & Validated
 
-_Last updated: 2026-06-30 • Scope reconciliation month: April 2026 • Dialect: Presto/Trino (Spark twins exist)_
+_Last updated: 2026-06-30 • Comparison month: April 2026 • Dialect: Presto/Trino (Spark versions also exist)_
 
-## TL;DR
+## The short version
 
-- The right universe for "AV trips" is the **AV-native spine `amd.fact_amd_trip`**, filtered to **AV-delivered** with two signals: the served vehicle is a flagged AV **or** the trip ran on the self-driving flow.
-- This method is **provably complete**: tested against the independent AV vehicle registry, it misses ~**4 trips in 2.38M** (0 completed).
-- It is a **strict superset of the DS/PM pull's real AV trips**. For April 2026 it captured **+25,603 AV trips (+6.0%)** that DS/PM misses, while the only **253** trips DS/PM had that we drop were **all non-completed and not even in the AV spine** (i.e., not real AV trips).
-- Two corrections were validated and applied: **exclude Polestar** (an `is_autonomous` false-positive) and **drop the `fact_amd_offer` partner lookup** (it changed 0 labels).
-- Canonical query: **`av_trips_final_monthly_presto.sql`**.
+- The best place to count AV trips is the **AV-native trip table `amd.fact_amd_trip`**, where every row is already an AV job. We keep a trip if **the car that served it is a known autonomous vehicle, or the trip ran on the self-driving flow**.
+- We proved this is **complete**. When we checked it against an independent list of every registered AV vehicle, it missed about **4 trips out of 2.38 million**, and **none of those 4 had actually completed on an AV**.
+- It is **better than the current approach** in every way that matters. For April 2026 it found **25,603 more real AV trips (+6.0%)** than the current approach. The only **253** trips the current approach had that ours didn't were **trips that never completed and were not AV trips at all**.
+- Two clean-ups were tested and applied: we **remove Polestar cars** (they are wrongly flagged as autonomous) and we **stopped using the offer table for partner names** (it made no difference).
+- The final query lives in **`av_trips_final_monthly_presto.sql`**.
 
 ---
 
-## 1. The question
+## 1. The question we set out to answer
 
-> Of every AV trip that actually happened in a given month, does our method capture all of them — and how does it differ from the Data Science / PM SQL that's been used so far?
+> For any given month, are we capturing **every** AV trip that actually happened — and how does that differ from the way AV trips have been counted so far?
 
-## 2. The two methods, side by side
+## 2. Two ways to count AV trips
 
-| | **DS/PM method** (legacy) | **Our validated method** (canonical) |
-|---|---|---|
-| Source table | `dwh.fact_trip` (general mobility) | `amd.fact_amd_trip` (**AV-native** — every row is an AV job) |
-| How a trip is "AV" | INNER JOIN to `driver.dim_earner_gig` where `gig_type ∈ (autonomous transport)` **and `status='ACTIVE'`**, on `ft.driver_uuid = earner_uuid` | `dwh.dim_vehicle.is_autonomous(last_vehicle_uuid)=true` **OR** normalized `flow_type='selfdriving'` |
-| Trip key | `ft.uuid` | `job_uuid` (deduped to 1 row/trip) |
-| Partner | `kirby_external_data.lookup_amd_partner` org_name | vehicle make → matched make → `partner_name` |
-| Known weaknesses | gig churn, wrong join key, mileage fan-out | none material (see validation) |
+There are two fundamentally different ways to decide whether a trip is an AV trip.
 
-Both methods share the **same trip-uuid space** (`ft.uuid` == `amd.fact_amd_trip.job_uuid`), so they can be reconciled exactly.
+**The current approach (counting by the driver).**
+It starts from the general trips table (`dwh.fact_trip`) and keeps a trip only if the driver on it is currently an **active** AV gig driver. In other words, it asks *"was this trip done by someone who is on the AV driver roster right now?"*
 
-## 3. Our validated definition (what "an AV trip" means)
+**Our approach (counting by the trip itself).**
+It starts from the AV-native trip table (`amd.fact_amd_trip`), where every row is already an AV job, and keeps a trip if **the vehicle that served it is a known autonomous car, or the trip ran on the self-driving flow**. In other words, it asks *"was this trip actually served by an AV?"*
 
-```
-FROM amd.fact_amd_trip
-KEEP IF  dim_vehicle.is_autonomous(last_vehicle_uuid) = true
-         OR normalized flow_type = 'selfdriving'        -- lower(), strip 'flow_type_' prefix
-EXCLUDE  served vehicle make = 'Polestar'               -- is_autonomous false-positive
-DEDUP    to one row per job_uuid
-```
+Both approaches label trips with the same trip ID, so we can line them up one-to-one and compare them exactly.
 
-- **AV-requested** = any row that passes the filter.
-- **AV-completed/delivered** = `last_matched_av_offer_ts.completed_timestamp_local IS NOT NULL`.
+## 3. What our approach actually does
 
-## 4. Why this is different from — and better than — the DS/PM SQL
+In plain terms:
 
-The DS/PM SQL identifies AV trips by **who the driver is** (an active AV gig earner), reading from the general `dwh.fact_trip` table. That introduces three structural problems:
+1. Start from the AV-native trip table.
+2. Keep a trip if **the serving car is a known autonomous vehicle** **or** **the trip ran on the self-driving flow**.
+3. **Drop Polestar cars** — they are incorrectly tagged as autonomous and are not real AVs.
+4. **Collapse to one row per trip** (the source table occasionally repeats a trip).
 
-1. **Gig churn (`status='ACTIVE'`).** Earners that have since gone inactive are dropped, silently removing their historical trips.
-2. **Join-key mismatch.** Matching `fact_trip.driver_uuid` to the gig `earner_uuid` misses AV-native jobs that aren't tied to an active earner row.
-3. **It's not the AV-native universe.** `fact_trip` also contains non-AV legs by AV earners and rows that never became real AV jobs.
+We then report two numbers:
+- **AV trips requested** — every trip that passes the rule above.
+- **AV trips completed** — the subset that actually finished on the AV.
 
-Our method instead identifies AV trips by **what the trip actually was** (served on an AV vehicle / ran on the AV flow), reading from the AV-native spine. That removes all three problems.
+## 4. Why the current approach undercounts
+
+Because the current approach decides "is this an AV trip?" based on **the driver's current roster status**, it leaks trips in three ways:
+
+1. **Drivers fall off the roster.** It only keeps trips for drivers marked *active right now*. As soon as a driver becomes inactive, all of their past AV trips silently disappear from the count.
+2. **The driver-to-trip link is imperfect.** It matches trips to drivers on an ID that doesn't always line up, so genuine AV jobs get missed.
+3. **It's reading the wrong table.** The general trips table also contains non-AV trips by AV drivers and trips that never actually became AV jobs — so it both misses real AV trips and lets in things that aren't AV trips.
+
+Our approach avoids all three because it judges the **trip**, not the **driver**, and reads the table where every row is already an AV job.
 
 ## 5. The evidence
 
-### 5a. Completeness vs an independent authority (`amd.fact_amd_vehicle`)
+### 5a. We checked it against an independent list of AV vehicles
 
-We re-tested the 2-signal filter against the AV vehicle **registry** (every `vehicle_uuid` there is an AV by construction), over a recent window of **2.38M jobs**:
+We took an independent registry that lists **every registered AV vehicle** and used it to see whether our rule was quietly dropping any real AV trips. Over a recent window of **2.38 million trips**:
 
-| signal | result |
-|---|---|
-| genuine AV-served trips dropped by our filter | **4** (0.00017%) |
-| of those, actually completed on the AV | **0** |
-| AV-**matched**-but-human-served (redispatch), correctly excluded | ~853,000 |
+- Only **4 trips** that were genuinely served by a registered AV were dropped by our rule (about **2 in a million**).
+- **None** of those 4 had actually completed on an AV.
+- A large group (~**853,000**) was correctly left out: these were trips where an AV was **offered or matched but a human car actually did the trip** (a re-dispatch). Those are not AV trips.
 
-Adding the registry as a 3rd signal recovered **0** completed trips per month — so the 2-signal filter is complete as-is.
+Adding the AV-vehicle registry as a third rule recovered **zero** completed trips — so the two-signal rule is already complete.
 
-### 5b. The "WeRide Abu Dhabi" question — settled
+### 5b. The "WeRide Abu Dhabi" question — answered
 
-Per-partner split of the trips our filter drops:
+People worried we might be missing WeRide trips in Abu Dhabi. We split every trip our rule drops by partner and by what role the AV played:
 
-- **WeRide: 20,119 dropped, 100% `matched_only` (a human car served), 0 served by a WeRide AV.**
-- Across all partners, only **4** dropped trips were genuinely served by a registered AV car (2 Waymo + 2 Avride), none completed.
+- For **WeRide**, **20,119** trips were dropped — and **every single one** was a case where the AV was matched but **a human car actually served the trip**. **Zero** were served by a WeRide AV.
+- Across all partners combined, only **4** dropped trips were truly served by an AV (2 Waymo, 2 Avride), and none completed.
 
-→ The dropped WeRide volume is **AV-matched-then-human-redispatch**, not AV-delivered. Correctly excluded.
+So the dropped WeRide volume is not missed AV trips — it's human-served re-dispatches, correctly excluded.
 
-### 5c. Head-to-head reconciliation — April 2026
+### 5c. Head-to-head for April 2026
 
-| bucket | trips | interpretation |
+We lined up the two approaches trip-by-trip for April 2026:
+
+| | trips | what it means |
 |---|---|---|
-| in both | 419,464 | agree |
-| **DS/PM only** | **253** | **all `is_completed=FALSE` AND absent from the AV spine → not real AV trips** |
-| **ours only** | **25,603** | **real AV trips DS/PM misses (gig churn + join gaps)** |
-| DS/PM total | 419,717 | |
-| ours total | 445,067 | **+6.0% vs DS/PM** |
+| In both | 419,464 | the two approaches agree |
+| **Only in the current approach** | **253** | **every one was a trip that never completed and wasn't in the AV trip table at all — i.e., not a real AV trip** |
+| **Only in our approach** | **25,603** | **real AV trips the current approach misses** (mostly because the driver was no longer "active") |
+| Current approach total | 419,717 | |
+| Our total | 445,067 | **about 6% more trips** |
 
-99.94% of the DS/PM pull sits inside ours; their only "extra" 253 rows are non-trips.
+Nearly everything the current approach finds (99.94%) is already inside our result. The handful it had on top — 253 trips — turned out not to be AV trips.
 
-### 5d. Polestar correction
+### 5d. The Polestar clean-up
 
-Polestar cars are flagged `is_autonomous=true` in `dim_vehicle` but are **not real AVs** (they qualified only via the flag, never via `flow=selfdriving`). Excluded across all method files. Impact on April: 445,067 → **445,062** (5 trips).
+Polestar cars are mistakenly tagged as autonomous in the vehicle table, but they are not real AVs (they only ever got in through that wrong tag, never through the self-driving flow). We now exclude them everywhere. For April this removed just **5 trips** (445,067 → 445,062).
 
-### 5e. Partner attribution — `fact_amd_offer` not needed
+### 5e. We don't need the offer table for partner names
 
-Tested whether pulling `offer_partner` from `amd.fact_amd_offer` improves labels: **100% of trips (445,062/445,062) resolve on vehicle make**, so `offer_partner` changed 0 labels and rescued 0 `Unknown`. Dropped it — pure scan cost for no benefit.
+We tested whether pulling partner names from the offer table gave better labels. It didn't: **100% of trips already get a correct partner name from the vehicle make** (445,062 of 445,062). Using the offer table changed **no** labels and rescued **no** "Unknown" partners, so we removed it — it was extra cost for no gain.
 
-## 6. Definitions to keep straight
+## 6. A few definitions worth keeping straight
 
-- **AV-delivered ≠ AV-matched.** A trip can be offered to/matched with an AV but completed by a human (redispatch). Those are **not** AV trips and are correctly excluded.
-- **Requested vs completed.** Report `av_trips_requested` (passed the filter) and `av_trips_completed` (completed on the AV) separately.
-- **`'\N'`** is the warehouse null sentinel; always wrap make/partner/city/flow reads in `NULLIF(..., '\N')`.
+- **Served by an AV is not the same as matched to an AV.** A trip can be offered to or matched with an AV but then completed by a human (a re-dispatch). Those are **not** AV trips.
+- **Requested vs completed.** "Requested" means the trip passed our AV rule; "completed" means it actually finished on the AV. Always report them separately.
 
-## 7. Files
+## 7. Where everything lives
 
-| File | Purpose |
+| File | What it's for |
 |---|---|
-| `av_trips_final_monthly_presto.sql` | **Canonical** "all AV trips for a given month" (trip list + monthly roll-up) |
-| `investigate_av_trip_capture_completeness.sql` / `_presto.sql` | Completeness diagnostics (S0–S6) vs the AV vehicle registry |
-| `compare_trips_ds_pm_vs_ours_apr2026_presto.sql` | Trip-uuid reconciliation DS/PM vs ours (April 2026) |
-| `test_offer_partner_vs_original_presto.sql` | Evidence that `offer_partner` adds nothing |
-| `compare_trip_spine_legacy_vs_kb.sql`, `waymo_incident_rate_investigation_spark.sql` | Canonical Spark methods (Polestar exclusion applied) |
+| `av_trips_final_monthly_presto.sql` | **The final query** — all AV trips for a given month (trip list + monthly summary) |
+| `investigate_av_trip_capture_completeness.sql` (and `_presto`) | The completeness checks against the AV-vehicle registry |
+| `compare_trips_ds_pm_vs_ours_apr2026_presto.sql` | The April 2026 trip-by-trip comparison of the two approaches |
+| `test_offer_partner_vs_original_presto.sql` | The test showing the offer table adds nothing to partner names |
+| `compare_trip_spine_legacy_vs_kb.sql`, `waymo_incident_rate_investigation_spark.sql` | The Spark versions of our method (Polestar already excluded) |
 
 ## 8. Recommendation
 
-Adopt `av_trips_final_monthly_presto.sql` as the single source of truth for AV trip counts. Re-run **S6** of the completeness diagnostic periodically as a cheap monitor: if a brand-new partner ever ships cars absent from `dim_vehicle` with a non-`selfdriving` flow, it would surface there first, at which point we'd add the AV-vehicle registry as a third signal.
+Use `av_trips_final_monthly_presto.sql` as the single source of truth for AV trip counts. As a cheap safety check, re-run the per-partner split (S6 in the completeness file) every so often: if a brand-new partner ever shows up with cars that aren't tagged autonomous and don't run on the self-driving flow, that's where it would appear first — and that's the moment to add the AV-vehicle registry as a third signal.
