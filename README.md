@@ -1,13 +1,13 @@
 # Identifying AV Trips: What I Found & Validated
 
-_Last updated: 2026-06-30. Comparison month: April 2026. Dialect: Presto/Trino (I also have Spark versions)._
+_Last updated: 2026-07-01. Comparison month: April 2026. Dialect: Presto/Trino (I also have Spark versions)._
 
 ## The short version
 
 - I found that the best place to count AV trips is the AV-native trip table `amd.fact_amd_trip`, where every row is already an AV job. I keep a trip if the car that served it is a known autonomous vehicle, or the trip ran on the self-driving flow.
 - I proved this is complete. When I checked it against an independent list of every registered AV vehicle, it missed about 4 trips out of 2.38 million, and none of those 4 had actually completed on an AV.
 - I found it to be better than the current approach in every way that matters. For April 2026 my method found 25,603 more real AV trips (+6.0%) than the current approach. The only 253 trips the current approach had that mine didn't were trips that never completed and were not AV trips at all.
-- I tested and applied two clean-ups: I remove Polestar cars (they are wrongly flagged as autonomous) and I stopped using the offer table for partner names (it made no difference).
+- I tested and applied two clean-ups: I remove a small set of cars that are wrongly flagged as autonomous (Polestar, Fisker, Honda) and I stopped using the offer table for partner names (it made no difference).
 - My final query lives in `av_trips_final_monthly_presto.sql`.
 
 ---
@@ -50,7 +50,7 @@ In plain terms:
 
 1. I start from the AV-native trip table.
 2. I keep a trip if the serving car is a known autonomous vehicle, or the trip ran on the self-driving flow.
-3. I drop Polestar cars, because they are incorrectly tagged as autonomous and are not real AVs.
+3. I drop a few makes that are incorrectly tagged as autonomous (Polestar, Fisker, Honda) and are not real AVs.
 4. I collapse to one row per trip, because the source table occasionally repeats a trip.
 
 ```sql
@@ -58,7 +58,7 @@ FROM amd.fact_amd_trip AS t
 LEFT JOIN dwh.dim_vehicle AS fv ON fv.vehicle_uuid = t.last_vehicle_uuid
 WHERE ( fv.is_autonomous = true
         OR COALESCE(lower(t.flow_type),'') IN ('selfdriving','flow_type_selfdriving') )
-  AND COALESCE(NULLIF(lower(fv.make),'\N'),'') <> 'polestar'   -- drop the false-positive make
+  AND COALESCE(NULLIF(lower(fv.make),'\N'),'') NOT IN ('polestar','fisker','honda')   -- drop false-positive makes
 GROUP BY t.job_uuid                                            -- one row per trip
 
 I match `flow_type` against an exact list of its known encodings rather than a
@@ -154,15 +154,31 @@ FULL OUTER JOIN my_approach AS mine ON current.trip_uuid = mine.trip_uuid
 
 Nearly everything the current approach finds (99.94%) is already inside my result. The handful it had on top, 253 trips, turned out not to be AV trips. When I looked at those 253, every one had `is_completed = FALSE` and did not exist in `amd.fact_amd_trip` at all.
 
-### 5d. The Polestar clean-up
+### 5d. The non-AV make clean-up (Polestar, Fisker, Honda)
 
-I found that Polestar cars are mistakenly tagged as autonomous in the vehicle table, but they are not real AVs. They only ever got in through that wrong tag, never through the self-driving flow. I now exclude them everywhere:
+A few makes are mistakenly tagged as autonomous in the vehicle table but are not real AVs. They only ever got in through that wrong tag, never through the self-driving flow (their trips run on the normal p2p/human flow), and none of them ever completed on an AV. I now exclude them everywhere:
 
 ```sql
-AND COALESCE(NULLIF(lower(fv.make),'\N'),'') <> 'polestar'
+AND COALESCE(NULLIF(lower(fv.make),'\N'),'') NOT IN ('polestar','fisker','honda')
 ```
 
-For April this removed just 5 trips (445,067 goes to 445,062).
+I identified these by listing every make the autonomous flag keeps and checking how much of each make's volume actually runs the self-driving flow (`validate_and_vs_or_flow_flag_presto.sql`, Statement 4, last 12 months). The separation is razor-sharp:
+
+| make | flag-kept trips | self-driving trips | completed on AV | % self-driving |
+|---|---|---|---|---|
+| Waymo | 3,595,993 | 3,591,836 | 3,382,777 | 99.88% |
+| Avride | 89,480 | 89,209 | 81,040 | 99.7% |
+| WeRide | 61,234 | 61,229 | 47,878 | 99.99% |
+| Motional | 3,867 | 3,867 | 3,063 | 100% |
+| Nuro | 2,987 | 2,987 | 1,767 | 100% |
+| Baidu | 428 | 428 | 224 | 100% |
+| May Mobility | 43 | 43 | 11 | 100% |
+| **Polestar** | **353** | **0** | **0** | **0%** |
+| **Honda** | **1** | **0** | **0** | **0%** |
+
+Every real AV make runs the self-driving flow on ~100% of its trips and completes millions of rides. Polestar (353 trips) and Honda (1 trip) run it on **zero** and complete **zero** — the classic false-positive signature, so I exclude both. The impact is tiny and never touches a real AV trip: in April the exclusion removed just 5 trips (445,067 goes to 445,062), all Polestar, none completed.
+
+**Fisker** did not appear in this 12-month window at all; it showed up only as a handful of never-completed `p2p` rows in the wider 2.38-million-trip check. I keep it in the list as harmless future-proofing so the rule stays robust as that make reappears.
 
 ### 5e. I don't need the offer table for partner names
 
@@ -188,7 +204,8 @@ COALESCE(NULLIF(fv.make,'\N'),           -- served vehicle make
 | `investigate_av_trip_capture_completeness.sql` (and `_presto`) | My completeness checks against the AV-vehicle registry |
 | `compare_trips_ds_pm_vs_ours_apr2026_presto.sql` | My April 2026 trip-by-trip comparison of the two approaches |
 | `test_offer_partner_vs_original_presto.sql` | My test showing the offer table adds nothing to partner names |
-| `compare_trip_spine_legacy_vs_kb.sql`, `waymo_incident_rate_investigation_spark.sql` | The Spark versions of my method (Polestar already excluded) |
+| `compare_trip_spine_legacy_vs_kb.sql`, `waymo_incident_rate_investigation_spark.sql` | The Spark versions of my method (Polestar, Fisker, Honda excluded) |
+| `validate_and_vs_or_flow_flag_presto.sql` | My test of OR vs AND on the two signals, and the "false-positive make" check that identified Polestar and Fisker |
 
 ## 8. My recommendation
 
