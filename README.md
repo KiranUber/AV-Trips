@@ -39,7 +39,7 @@ WHERE gig.gig_type IN ('uber/autonomous/transport/goods',
 FROM amd.fact_amd_trip AS t
 LEFT JOIN dwh.dim_vehicle AS fv ON fv.vehicle_uuid = t.last_vehicle_uuid
 WHERE fv.is_autonomous = true                                             -- served by a known AV
-   OR regexp_replace(lower(COALESCE(t.flow_type,'')),'^flow_type_','') = 'selfdriving'  -- or ran on the AV flow
+   OR COALESCE(lower(t.flow_type),'') IN ('selfdriving','flow_type_selfdriving')  -- or ran on the AV flow
 ```
 
 Both approaches label trips with the same trip ID (`ft.uuid` is the same value as `amd.fact_amd_trip.job_uuid`), so I can line them up one-to-one and compare them exactly.
@@ -57,9 +57,15 @@ In plain terms:
 FROM amd.fact_amd_trip AS t
 LEFT JOIN dwh.dim_vehicle AS fv ON fv.vehicle_uuid = t.last_vehicle_uuid
 WHERE ( fv.is_autonomous = true
-        OR regexp_replace(lower(COALESCE(t.flow_type,'')),'^flow_type_','') = 'selfdriving' )
+        OR COALESCE(lower(t.flow_type),'') IN ('selfdriving','flow_type_selfdriving') )
   AND COALESCE(NULLIF(lower(fv.make),'\N'),'') <> 'polestar'   -- drop the false-positive make
 GROUP BY t.job_uuid                                            -- one row per trip
+
+I match `flow_type` against an exact list of its known encodings rather than a
+`LIKE '%selfdriving'` suffix match. The suffix match is looser and errs both ways: it would
+wrongly keep a value like `flow_type_non_selfdriving` (it ends in "selfdriving") and would
+silently drop a value like `flow_type_selfdriving_v2` (it does not). The `COALESCE(...,'')`
+wrapper keeps a missing `flow_type` evaluating as "not self-driving" instead of unknown.
 ```
 
 I then report two numbers:
