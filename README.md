@@ -182,7 +182,7 @@ Every real AV make runs the self-driving flow on ~100% of its trips and complete
 
 ### 5e. I don't need the offer table for partner names
 
-I tested whether pulling partner names from the offer table gave better labels. It did not: 100% of trips already get a correct partner name from the vehicle make (445,062 of 445,062). Using the offer table changed no labels and rescued no "Unknown" partners, so I removed it. My partner label is now just:
+I tested whether pulling partner names from the offer table gave better labels. It did not. I first checked April 2026 (100% resolved by vehicle make, 445,062 of 445,062), then re-ran it across the full history from January 2025 to now: **100% of trips still get a correct partner name from the vehicle make (4,233,061 of 4,233,061)**. Not a single trip ever fell through to the fallback, so the offer table changed no labels and rescued no "Unknown" partners. I removed it. My partner label is now just:
 
 ```sql
 COALESCE(NULLIF(fv.make,'\N'),           -- served vehicle make
