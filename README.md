@@ -1,103 +1,101 @@
-# Identifying AV Trips: What I Found & Validated
+# How I count AV trips, and why my number doesn't match the old one
 
-_Last updated: 2026-07-01. Comparison month: April 2026. Dialect: Presto/Trino (I also have Spark versions)._
+_My working notes. Last touched 2026-07-01. Figures are April 2026 unless I say otherwise. Written for Presto/Trino; I kept Spark copies of the main queries too._
 
-## The short version
+## The gist
 
-- I found that the best place to count AV trips is the AV-native trip table `amd.fact_amd_trip`, where every row is already an AV job. I keep a trip if the car that served it is a known autonomous vehicle, or the trip ran on the self-driving flow.
-- I proved this is complete. When I checked it against an independent list of every registered AV vehicle, it missed about 4 trips out of 2.38 million, and none of those 4 had actually completed on an AV.
-- I found it to be better than the current approach in every way that matters. For April 2026 my method found 25,603 more real AV trips (+6.0%) than the current approach. The only 253 trips the current approach had that mine didn't were trips that never completed and were not AV trips at all.
-- I tested and applied two clean-ups: I remove a small set of cars that are wrongly flagged as autonomous (Polestar, Fisker, Honda) and I stopped using the offer table for partner names (it made no difference).
-- My final query lives in `av_trips_final_monthly_presto.sql`.
+Count AV trips straight out of `amd.fact_amd_trip`. Every row in that table is already an AV job, so I'm not guessing at anything. A trip makes the cut if either the car that served it is flagged autonomous, or the trip ran on the self-driving flow.
 
----
+What I nailed down along the way:
 
-## 1. The question I set out to answer
+- It's not missing anything that matters. I held it up against a separate registry of every AV vehicle we have on record, and it dropped roughly 4 trips out of 2.38 million. None of those 4 actually finished on an AV.
+- It's ahead of the old "active driver" method. April alone: 25,603 trips it caught that the old method never saw, about 6% more. The old method did have 253 trips I didn't, but every single one was an unfinished trip that isn't even in the AV table.
+- I cleaned up two things: pulled out a few car makes that are mislabeled as autonomous (Polestar, Fisker, Honda), and dropped the offer table for partner names once I was sure it wasn't earning its keep.
 
-> For any given month, am I capturing every AV trip that actually happened, and how does that differ from the way AV trips have been counted so far?
+The query I actually run is `av_trips_final_monthly_presto.sql`.
 
-## 2. Two ways to count AV trips
+## What I was trying to answer
 
-I compared two fundamentally different ways to decide whether a trip is an AV trip.
+For a given month, am I really catching every AV trip that happened? And why doesn't my count line up with how AV trips have been counted so far?
 
-**The current approach (counting by the driver).** It starts from the general trips table `dwh.fact_trip` and keeps a trip only if the driver on it is currently an active AV gig driver. In other words, it asks "was this trip done by someone who is on the AV driver roster right now?"
+## Two completely different ways to count
+
+These two approaches don't just differ in the details, they start from opposite ideas of what makes a trip an "AV trip."
+
+The old way counts by the driver. It starts from the general trips table `dwh.fact_trip` and only keeps a trip if whoever was on it is flagged as an active AV gig driver at this moment:
 
 ```sql
--- current approach: keep a trip only if its driver is an ACTIVE AV gig driver
+-- old way: keep a trip only if its driver is an ACTIVE AV gig driver
 FROM dwh.fact_trip AS ft
 INNER JOIN driver.dim_earner_gig AS gig
         ON ft.driver_uuid = gig.earner_uuid
 WHERE gig.gig_type IN ('uber/autonomous/transport/goods',
                        'uber/autonomous/transport/passenger')
-  AND gig.status = 'ACTIVE'          -- the fragile part: roster status "right now"
+  AND gig.status = 'ACTIVE'          -- this line is the whole problem, more below
 ```
 
-**My approach (counting by the trip itself).** I start from the AV-native trip table `amd.fact_amd_trip`, where every row is already an AV job, and keep a trip if the vehicle that served it is a known autonomous car, or the trip ran on the self-driving flow. In other words, I ask "was this trip actually served by an AV?"
+The way I do it counts by the trip. I start from `amd.fact_amd_trip`, which is already nothing but AV jobs, and keep a trip if the car that served it is a known AV or it ran on the self-driving flow:
 
 ```sql
--- my approach: keep a trip if the trip itself was served by an AV
+-- my way: keep a trip if the trip itself was served by an AV
 FROM amd.fact_amd_trip AS t
 LEFT JOIN dwh.dim_vehicle AS fv ON fv.vehicle_uuid = t.last_vehicle_uuid
 WHERE fv.is_autonomous = true                                             -- served by a known AV
-   OR COALESCE(lower(t.flow_type),'') IN ('selfdriving','flow_type_selfdriving')  -- or ran on the AV flow
+   OR COALESCE(lower(t.flow_type),'') IN ('selfdriving','flow_type_selfdriving')  -- or it ran the AV flow
 ```
 
-Both approaches label trips with the same trip ID (`ft.uuid` is the same value as `amd.fact_amd_trip.job_uuid`), so I can line them up one-to-one and compare them exactly.
+One thing that made the comparison easy: both tables key off the same trip id (`ft.uuid` is the same value as `amd.fact_amd_trip.job_uuid`), so I can line them up one to one and see exactly which trips each side kept.
 
-## 3. What my approach actually does
+## What my query is doing, step by step
 
-In plain terms:
+It's not complicated:
 
-1. I start from the AV-native trip table.
-2. I keep a trip if the serving car is a known autonomous vehicle, or the trip ran on the self-driving flow.
-3. I drop a few makes that are incorrectly tagged as autonomous (Polestar, Fisker, Honda) and are not real AVs.
-4. I collapse to one row per trip, because the source table occasionally repeats a trip.
+1. Start from the AV-native table.
+2. Keep the trip if the serving car is a known AV, or it ran the self-driving flow.
+3. Drop Polestar, Fisker, and Honda. They carry the autonomous tag but aren't real AVs (I get into this later).
+4. Collapse duplicates to one row per trip, because the table repeats a job every so often.
 
 ```sql
 FROM amd.fact_amd_trip AS t
 LEFT JOIN dwh.dim_vehicle AS fv ON fv.vehicle_uuid = t.last_vehicle_uuid
 WHERE ( fv.is_autonomous = true
         OR COALESCE(lower(t.flow_type),'') IN ('selfdriving','flow_type_selfdriving') )
-  AND COALESCE(NULLIF(lower(fv.make),'\N'),'') NOT IN ('polestar','fisker','honda')   -- drop false-positive makes
-GROUP BY t.job_uuid                                            -- one row per trip
-
-I match `flow_type` against an exact list of its known encodings rather than a
-`LIKE '%selfdriving'` suffix match. The suffix match is looser and errs both ways: it would
-wrongly keep a value like `flow_type_non_selfdriving` (it ends in "selfdriving") and would
-silently drop a value like `flow_type_selfdriving_v2` (it does not). The `COALESCE(...,'')`
-wrapper keeps a missing `flow_type` evaluating as "not self-driving" instead of unknown.
+  AND COALESCE(NULLIF(lower(fv.make),'\N'),'') NOT IN ('polestar','fisker','honda')
+GROUP BY t.job_uuid
 ```
 
-I then report two numbers:
+I was picky about one thing here. I match `flow_type` against the exact values I know it takes instead of writing `LIKE '%selfdriving'`. A suffix match is sloppy both ways: it would happily keep something like `flow_type_non_selfdriving` (that string does end in "selfdriving"), and it would quietly miss a future `flow_type_selfdriving_v2`. The `COALESCE(..., '')` is just so a missing value reads as "not self-driving" rather than turning into a null that muddies the logic.
+
+I report two numbers, and I keep them apart on purpose:
 
 ```sql
 COUNT(*)                                                                 AS av_trips_requested,  -- passed the rule
 SUM(IF(t.last_matched_av_offer_ts.completed_timestamp_local IS NOT NULL, 1, 0)) AS av_trips_completed  -- finished on the AV
 ```
 
-- **AV trips requested**: every trip that passes the rule above.
-- **AV trips completed**: the subset that actually finished on the AV.
+- Requested is every trip that passed the rule.
+- Completed is the subset that actually finished on the AV.
 
-## 4. Why the current approach undercounts
+## Where the old way loses trips
 
-Because the current approach decides "is this an AV trip?" based on the driver's current roster status, I found it leaks trips in three ways:
+Because it decides "is this an AV trip?" from the driver's current roster status, it springs leaks in three spots:
 
-1. **Drivers fall off the roster.** It only keeps trips for drivers marked active right now. The moment a driver becomes inactive, all of their past AV trips silently disappear from the count. This is the `AND gig.status = 'ACTIVE'` line doing the damage:
+1. **Drivers drop off the roster.** It only keeps trips for drivers who are active right now. The second a driver goes inactive, their entire AV history disappears from the count. That single `AND gig.status = 'ACTIVE'` line is where most of the loss comes from:
 
 ```sql
-AND gig.status = 'ACTIVE'   -- yesterday's active driver, inactive today, takes all their history out
+AND gig.status = 'ACTIVE'   -- active yesterday, inactive today, and all their history is gone
 ```
 
-2. **The driver-to-trip link is imperfect.** It matches trips to drivers on an ID (`ft.driver_uuid = gig.earner_uuid`) that doesn't always line up, so genuine AV jobs get missed.
-3. **It's reading the wrong table.** The general trips table also contains non-AV trips by AV drivers and trips that never actually became AV jobs, so it both misses real AV trips and lets in things that aren't AV trips.
+2. **The driver-to-trip join is leaky.** Matching `ft.driver_uuid` to `gig.earner_uuid` doesn't always land, so real AV jobs slip through the cracks.
+3. **It's the wrong table to start from.** `dwh.fact_trip` also holds non-AV trips by AV drivers, plus trips that never actually became AV jobs, so it manages to both miss real AV trips and let in things that aren't.
 
-My approach avoids all three because it judges the trip, not the driver, and reads the table where every row is already an AV job.
+Mine avoids all of that by judging the trip itself, not the driver, and by starting from a table where every row is already an AV job.
 
-## 5. The evidence
+## The evidence
 
-### 5a. I checked it against an independent list of AV vehicles
+### Am I quietly dropping any real AV trips?
 
-I took an independent registry that lists every registered AV vehicle (`amd.fact_amd_vehicle`) and used it to see whether my rule was quietly dropping any real AV trips. The check counts trips where the serving car is a registered AV but my rule did not keep it:
+To check, I grabbed a separate registry of every AV vehicle on record (`amd.fact_amd_vehicle`) and used it to look for trips where a registered AV clearly did the driving but my rule still let it go:
 
 ```sql
 -- "silent miss": served by a registered AV, but my 2-signal rule dropped it
@@ -107,17 +105,17 @@ COUNT(DISTINCT CASE WHEN served_is_registered_av
                     THEN job_uuid END) AS served_av_dropped
 ```
 
-Over a recent window of 2.38 million trips:
+Across a recent 2.38 million trips:
 
-- Only 4 trips that were genuinely served by a registered AV were dropped by my rule (about 2 in a million).
-- None of those 4 had actually completed on an AV.
-- A large group (about 853,000) was correctly left out. These were trips where an AV was offered or matched but a human car actually did the trip (a re-dispatch). Those are not AV trips.
+- Only 4 trips genuinely served by a registered AV got dropped. That's about 2 in a million.
+- None of those 4 had finished on an AV anyway.
+- A big chunk, around 853,000, was left out on purpose. Those were trips where an AV got offered or matched but a human car ended up doing the ride (a re-dispatch), which isn't an AV trip.
 
-Adding the AV-vehicle registry as a third rule recovered zero completed trips, so I'm confident the two-signal rule is already complete.
+I also tried bolting the registry on as a third signal to see if it rescued anything. It rescued zero completed trips, so the two signals I already have are doing the job.
 
-### 5b. The "WeRide Abu Dhabi" question: I answered it
+### The WeRide Abu Dhabi worry
 
-There was a worry that I might be missing WeRide trips in Abu Dhabi. I split every trip my rule drops by partner and by what role the AV played:
+Someone raised the concern that I might be dropping WeRide trips in Abu Dhabi, so I checked it head on. I took every trip my rule drops and split it by partner and by what the AV was actually doing on that trip:
 
 ```sql
 CASE
@@ -127,14 +125,14 @@ CASE
 END AS av_role
 ```
 
-- For WeRide, 20,119 trips were dropped, and every single one was a case where the AV was matched but a human car actually served the trip. Zero were served by a WeRide AV.
-- Across all partners combined, only 4 dropped trips were truly served by an AV (2 Waymo, 2 Avride), and none completed.
+- WeRide had 20,119 dropped trips, and every one was a case where the AV got matched but a human car did the ride. Not a single one was actually served by a WeRide AV.
+- Lumping all partners together, only 4 dropped trips were truly AV-served (2 Waymo, 2 Avride), and none of them completed.
 
-So the dropped WeRide volume is not missed AV trips. It is human-served re-dispatches, which I correctly exclude.
+So that WeRide volume isn't missing AV trips. It's human-served re-dispatches, which I'm right to leave out.
 
-### 5c. Head-to-head for April 2026
+### Head to head, April 2026
 
-I lined up the two approaches trip-by-trip. The counts come straight from a full outer join on the trip ID:
+I lined the two approaches up trip by trip with a full outer join on the trip id:
 
 ```sql
 COUNT(*) FILTER (WHERE current.trip_uuid IS NOT NULL AND mine.trip_uuid IS NOT NULL) AS in_both,
@@ -146,23 +144,23 @@ FULL OUTER JOIN my_approach AS mine ON current.trip_uuid = mine.trip_uuid
 
 | | trips | what it means |
 |---|---|---|
-| In both | 419,464 | the two approaches agree |
-| **Only in the current approach** | **253** | **every one was a trip that never completed and wasn't in the AV trip table at all, so not a real AV trip** |
-| **Only in my approach** | **25,603** | **real AV trips the current approach misses, mostly because the driver was no longer "active"** |
-| Current approach total | 419,717 | |
-| My total | 445,067 | **about 6% more trips** |
+| In both | 419,464 | the two agree |
+| **Only the old way** | **253** | **all unfinished trips that aren't even in the AV table, so not real AV trips** |
+| **Only mine** | **25,603** | **real AV trips the old way misses, mostly drivers who went inactive** |
+| Old way total | 419,717 | |
+| Mine | 445,067 | **about 6% more** |
 
-Nearly everything the current approach finds (99.94%) is already inside my result. The handful it had on top, 253 trips, turned out not to be AV trips. When I looked at those 253, every one had `is_completed = FALSE` and did not exist in `amd.fact_amd_trip` at all.
+Almost everything the old way finds (99.94%) is already sitting inside my result. The 253 it had on top didn't hold up: every one had `is_completed = FALSE` and wasn't in `amd.fact_amd_trip` at all.
 
-### 5d. The non-AV make clean-up (Polestar, Fisker, Honda)
+### The mislabeled makes (Polestar, Fisker, Honda)
 
-A few makes are mistakenly tagged as autonomous in the vehicle table but are not real AVs. They only ever got in through that wrong tag, never through the self-driving flow (their trips run on the normal p2p/human flow), and none of them ever completed on an AV. I now exclude them everywhere:
+Some car makes carry the autonomous tag in the vehicle table but aren't real AVs. They only ever got the tag by mistake, they never ran the self-driving flow (their trips are on the normal p2p/human flow), and none of them ever finished a trip on an AV. So I drop them everywhere:
 
 ```sql
 AND COALESCE(NULLIF(lower(fv.make),'\N'),'') NOT IN ('polestar','fisker','honda')
 ```
 
-I identified these by listing every make the autonomous flag keeps and checking how much of each make's volume actually runs the self-driving flow (`validate_and_vs_or_flow_flag_presto.sql`, Statement 4, last 12 months). The separation is razor-sharp:
+I didn't just eyeball this. I listed every make the autonomous flag keeps and checked how much of each one's volume actually runs the self-driving flow (`validate_and_vs_or_flow_flag_presto.sql`, Statement 4, last 12 months). The split is about as clean as it gets:
 
 | make | flag-kept trips | self-driving trips | completed on AV | % self-driving |
 |---|---|---|---|---|
@@ -176,13 +174,13 @@ I identified these by listing every make the autonomous flag keeps and checking 
 | **Polestar** | **353** | **0** | **0** | **0%** |
 | **Honda** | **1** | **0** | **0** | **0%** |
 
-Every real AV make runs the self-driving flow on ~100% of its trips and completes millions of rides. Polestar (353 trips) and Honda (1 trip) run it on **zero** and complete **zero** — the classic false-positive signature, so I exclude both. The impact is tiny and never touches a real AV trip: in April the exclusion removed just 5 trips (445,067 goes to 445,062), all Polestar, none completed.
+Every genuine AV make sits near 100% self-driving and has racked up real completions. Polestar (353 trips) and Honda (1 trip) are the odd ones out: zero self-driving trips, zero completions. That's the giveaway, so both are gone. The cost of dropping them is tiny and never hits a real trip. In April it took out exactly 5 trips (445,067 down to 445,062), all Polestar, none completed.
 
-**Fisker** did not appear in this 12-month window at all; it showed up only as a handful of never-completed `p2p` rows in the wider 2.38-million-trip check. I keep it in the list as harmless future-proofing so the rule stays robust as that make reappears.
+Fisker is a slightly different case. It didn't show up at all in this 12-month window; it only surfaced earlier as a few never-completed p2p rows back in the wider 2.38-million-trip check. I left it in the exclusion list anyway so the rule doesn't break the next time that make turns up. Worth a second look if Fisker starts showing real volume again.
 
-### 5e. I don't need the offer table for partner names
+### Why I stopped using the offer table for partner names
 
-I tested whether pulling partner names from the offer table gave better labels. It did not. I first checked April 2026 (100% resolved by vehicle make, 445,062 of 445,062), then re-ran it across the full history from January 2025 to now: **100% of trips still get a correct partner name from the vehicle make (4,233,061 of 4,233,061)**. Not a single trip ever fell through to the fallback, so the offer table changed no labels and rescued no "Unknown" partners. I removed it. My partner label is now just:
+I wanted to know if pulling partner names from the offer table would give me cleaner labels. Turns out no. April looked perfect (445,062 of 445,062 resolved straight from the vehicle make), but one month didn't feel like enough, so I re-ran it over everything from January 2025 to now. Same story: **4,233,061 of 4,233,061 trips got a correct partner name from the vehicle make**. Not one trip ever fell through to the offer-table fallback, which means it was changing no labels and rescuing no "Unknown" partners. So I cut it. The label is just this now:
 
 ```sql
 COALESCE(NULLIF(fv.make,'\N'),           -- served vehicle make
@@ -191,22 +189,22 @@ COALESCE(NULLIF(fv.make,'\N'),           -- served vehicle make
          'Unknown') AS partner
 ```
 
-## 6. A few definitions I keep straight
+## Two distinctions I try not to blur
 
-- **Served by an AV is not the same as matched to an AV.** A trip can be offered to or matched with an AV but then completed by a human (a re-dispatch). Those are not AV trips.
-- **Requested vs completed.** "Requested" means the trip passed my AV rule. "Completed" means it actually finished on the AV. I always report them separately.
+- **Served by an AV is not the same as matched to an AV.** A trip can be offered to or matched with an AV and still get finished by a human (a re-dispatch). That's not an AV trip.
+- **Requested is not completed.** "Requested" means it passed my rule. "Completed" means it actually finished on the AV. I always keep those two numbers separate.
 
-## 7. Where everything lives
+## Where everything lives
 
 | File | What it's for |
 |---|---|
-| `av_trips_final_monthly_presto.sql` | My final query: all AV trips for a given month (trip list plus monthly summary) |
+| `av_trips_final_monthly_presto.sql` | The query I actually run: all AV trips for a month, plus a monthly summary |
 | `investigate_av_trip_capture_completeness.sql` (and `_presto`) | My completeness checks against the AV-vehicle registry |
-| `compare_trips_ds_pm_vs_ours_apr2026_presto.sql` | My April 2026 trip-by-trip comparison of the two approaches |
-| `test_offer_partner_vs_original_presto.sql` | My test showing the offer table adds nothing to partner names |
-| `compare_trip_spine_legacy_vs_kb.sql`, `waymo_incident_rate_investigation_spark.sql` | The Spark versions of my method (Polestar, Fisker, Honda excluded) |
-| `validate_and_vs_or_flow_flag_presto.sql` | My test of OR vs AND on the two signals, and the "false-positive make" check that identified Polestar and Fisker |
+| `compare_trips_ds_pm_vs_ours_apr2026_presto.sql` | The April trip-by-trip comparison of the two approaches |
+| `test_offer_partner_vs_original_presto.sql` | The test that showed the offer table adds nothing to partner names |
+| `compare_trip_spine_legacy_vs_kb.sql`, `waymo_incident_rate_investigation_spark.sql` | Spark copies of my method (Polestar, Fisker, Honda already excluded) |
+| `validate_and_vs_or_flow_flag_presto.sql` | OR vs AND on the two signals, plus the make check that flagged Polestar and Honda |
 
-## 8. My recommendation
+## What I'd recommend
 
-Use `av_trips_final_monthly_presto.sql` as the single source of truth for AV trip counts. As a cheap safety check, I'd re-run the per-partner split (S6 in the completeness file) every so often. If a brand-new partner ever shows up with cars that aren't tagged autonomous and don't run on the self-driving flow, that's where it would appear first, and that's the moment to add the AV-vehicle registry as a third signal.
+Treat `av_trips_final_monthly_presto.sql` as the source of truth for AV trip counts. The one bit of upkeep I'd keep doing is re-running the per-partner split (S6 in the completeness file) now and then. If a brand-new partner ever shows up with cars that aren't tagged autonomous and don't run the self-driving flow, that split is where it'll surface first, and that's the moment to fold the AV-vehicle registry in as a third signal.
